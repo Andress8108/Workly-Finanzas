@@ -11,8 +11,46 @@ import fs from 'node:fs/promises';
 import { upload, uploadToImageKit } from '../services/file_storage.js';
 import { normalizeTags, validateProjectDates } from '../utils/project_rules.js';
 import { getAvailableBudget } from '../utils/budget_rules.js';
+import {
+  calculateFinancialEvaluation,
+  evaluateDecision,
+  getDecisionSnapshot,
+  getDiagnosisCompletion,
+  getPhaseTransitionError,
+  getStudyCompletion,
+  hasFinancialOperationEvidence,
+  isDecisionCurrent,
+  PROJECT_PHASES,
+} from '../utils/project_workflow.js';
 
 const router = Router();
+const formatCopAmount = (amount) =>
+  `$${new Intl.NumberFormat('es-CO', { maximumFractionDigits: 0 }).format(amount)}`;
+
+function getInvestmentGateError(project) {
+  const phase = project.formulation?.lifecycle?.phase;
+  if (!phase) return null;
+  const phaseIndex = PROJECT_PHASES.indexOf(phase);
+  const investmentIndex = PROJECT_PHASES.indexOf('investment');
+  if (phaseIndex < investmentIndex) {
+    return 'El proyecto debe tener una decisión aprobada antes de registrar gastos de inversión.';
+  }
+  const latestDecision = project.decisions?.at(-1);
+  if (
+    latestDecision?.outcome !== 'accepted' ||
+    !isDecisionCurrent(latestDecision, project.formulation)
+  ) {
+    return 'La decisión de aceptación no está vigente; vuelve a evaluarla antes de continuar.';
+  }
+  return null;
+}
+
+async function hasExecutionEvidence(project) {
+  if (project.expenses?.some((expense) => expense.status === 'completed')) {
+    return true;
+  }
+  return Boolean(await Task.exists({ projectId: project.id, status: 'done' }));
+}
 
 async function notifyProjectMembers(project, actorId, type, title, body, expenseId) {
   const memberIds = [...new Set([project.leadId, ...project.memberIds])]
@@ -103,6 +141,9 @@ router.post('/:id/expenses', async (req, res) => {
     });
     if (!project) return res.status(403).json({ error: 'No tienes acceso a este proyecto' });
 
+    const investmentError = getInvestmentGateError(project);
+    if (investmentError) return res.status(409).json({ error: investmentError });
+
     const description = typeof req.body.description === 'string' ? req.body.description.trim() : '';
     const justification = typeof req.body.justification === 'string' ? req.body.justification.trim() : '';
     const amount = Number(req.body.amount);
@@ -142,7 +183,7 @@ router.post('/:id/expenses', async (req, res) => {
       req.user.id,
       'expenseRequest',
       'Solicitud de gasto',
-      `Se solicitaron ${amount} para ${description}`,
+      `Se solicitaron ${formatCopAmount(amount)} para ${description}`,
       expense.id,
     );
     res.status(201).json(expense);
@@ -155,6 +196,8 @@ router.patch('/:id/expenses/:expenseId/review', async (req, res) => {
   try {
     const project = await Project.findOne({ _id: req.params.id, leadId: req.user.id });
     if (!project) return res.status(403).json({ error: 'Sólo el líder del proyecto puede revisar gastos' });
+    const investmentError = getInvestmentGateError(project);
+    if (investmentError) return res.status(409).json({ error: investmentError });
     const expense = project.expenses.id(req.params.expenseId);
     if (!expense || expense.status !== 'pending') {
       return res.status(409).json({ error: 'La solicitud ya no está pendiente' });
@@ -230,6 +273,8 @@ router.post('/:id/expenses/:expenseId/receipt', async (req, res) => {
       $or: [{ leadId: req.user.id }, { memberIds: req.user.id }],
     });
     if (!project) return res.status(403).json({ error: 'No tienes acceso a este proyecto' });
+    const investmentError = getInvestmentGateError(project);
+    if (investmentError) return res.status(409).json({ error: investmentError });
     const expense = project.expenses.id(req.params.expenseId);
     if (!expense || expense.status !== 'approved') {
       return res.status(409).json({ error: 'Sólo puedes registrar compras de gastos aprobados' });
@@ -293,7 +338,7 @@ router.post('/:id/expenses/:expenseId/receipt', async (req, res) => {
       req.user.id,
       'expenseUpdate',
       'Compra registrada',
-      `Se registró un gasto de ${actualAmount} para ${expense.description}`,
+      `Se registró un gasto de ${formatCopAmount(actualAmount)} para ${expense.description}`,
       expense.id,
     );
     res.json(updatedExpense);
@@ -413,25 +458,253 @@ router.post('/', async (req, res) => {
   try {
     const startDate = req.body.startDate ? new Date(req.body.startDate) : null;
     const endDate = req.body.endDate ? new Date(req.body.endDate) : null;
-    const dateError = validateProjectDates(startDate, endDate);
+    const dateError = validateProjectDates(startDate, endDate, {
+      requireFutureDates: true,
+    });
     if (dateError) return res.status(400).json({ error: dateError });
     const budget = Number(req.body.budget ?? 0);
     if (!Number.isFinite(budget) || budget < 0) {
       return res.status(400).json({ error: 'El presupuesto debe ser un monto válido y no negativo' });
     }
+    const formulation = req.body.formulation &&
+      typeof req.body.formulation === 'object' &&
+      !Array.isArray(req.body.formulation)
+      ? { ...req.body.formulation }
+      : {};
+    const lifecycle = formulation.lifecycle &&
+      typeof formulation.lifecycle === 'object' &&
+      !Array.isArray(formulation.lifecycle)
+      ? { ...formulation.lifecycle }
+      : {};
+    formulation.lifecycle = { ...lifecycle, phase: 'idea' };
 
     const project = new Project({
       ...req.body,
       leadId: req.user.id,
       memberIds: [req.user.id],
+      status: 'planning',
       tags: normalizeTags(req.body.tags || req.body.tagsText || ''),
       budget,
       spent: 0,
       reservedBudget: 0,
+      approvedBudget: null,
       expenses: [],
+      decisions: [],
+      operationRecords: [],
+      adjustments: [],
+      formulation,
     });
     await project.save();
     res.status(201).json(project);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/:id/decisions', async (req, res) => {
+  try {
+    const project = await Project.findOne({ _id: req.params.id, leadId: req.user.id });
+    if (!project) {
+      return res.status(403).json({ error: 'Sólo el líder puede registrar la decisión del proyecto' });
+    }
+    if (project.formulation?.lifecycle?.phase !== 'decision') {
+      return res.status(409).json({ error: 'Lleva el proyecto a la etapa de decisión antes de registrar el resultado' });
+    }
+
+    const outcome = req.body.outcome;
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+    const observations = typeof req.body.observations === 'string'
+      ? req.body.observations.trim()
+      : '';
+    if (!['accepted', 'rejected'].includes(outcome) || reason.length < 5) {
+      return res.status(400).json({ error: 'Selecciona aceptar o rechazar e indica una justificación de al menos cinco caracteres' });
+    }
+
+    const result = evaluateDecision(project.formulation);
+    if (
+      !result.evaluation ||
+      !getDiagnosisCompletion(project.formulation).complete ||
+      !getStudyCompletion(project.formulation).complete
+    ) {
+      return res.status(409).json({
+        error: 'Completa el diagnóstico, los cinco estudios y los datos financieros antes de registrar una decisión',
+      });
+    }
+    if (outcome === 'accepted' && !result.approved) {
+      return res.status(409).json({
+        error: `No se puede aprobar el proyecto: ${result.errors.join(' ')}`,
+      });
+    }
+
+    let approvedBudget = null;
+    if (outcome === 'accepted') {
+      approvedBudget = Number(req.body.approvedBudget);
+      if (
+        !Number.isFinite(approvedBudget) ||
+        approvedBudget < result.evaluation.initialInvestment ||
+        approvedBudget < project.spent + project.reservedBudget
+      ) {
+        return res.status(400).json({
+          error: 'El presupuesto aprobado debe cubrir la inversión inicial y los compromisos registrados',
+        });
+      }
+    }
+
+    project.decisions.push({
+      outcome,
+      reason,
+      observations,
+      responsibleId: req.user.id,
+      decidedAt: new Date(),
+      approvedBudget,
+      studySnapshot: getDecisionSnapshot(project.formulation),
+      evaluation: result.evaluation,
+    });
+    if (outcome === 'accepted') {
+      project.approvedBudget = approvedBudget;
+      project.budget = approvedBudget;
+    } else {
+      project.approvedBudget = null;
+      if (project.status === 'active') project.status = 'onHold';
+    }
+    await project.save();
+    res.status(201).json(project);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/:id/operations', async (req, res) => {
+  try {
+    const project = await Project.findOne({
+      _id: req.params.id,
+      $or: [{ leadId: req.user.id }, { memberIds: req.user.id }],
+    });
+    if (!project) return res.status(403).json({ error: 'No tienes acceso a este proyecto' });
+    const investmentError = getInvestmentGateError(project);
+    if (investmentError) return res.status(409).json({ error: investmentError });
+    if (
+      PROJECT_PHASES.indexOf(project.formulation?.lifecycle?.phase) <
+      PROJECT_PHASES.indexOf('operation')
+    ) {
+      return res.status(409).json({ error: 'Lleva el proyecto a operación antes de registrar resultados reales' });
+    }
+
+    const type = req.body.type;
+    const category = typeof req.body.category === 'string' ? req.body.category.trim() : '';
+    const description = typeof req.body.description === 'string'
+      ? req.body.description.trim()
+      : '';
+    const occurredAt = req.body.occurredAt ? new Date(req.body.occurredAt) : null;
+    const amount = req.body.amount == null ? 0 : Number(req.body.amount);
+    const quantity = req.body.quantity == null ? null : Number(req.body.quantity);
+    const unit = typeof req.body.unit === 'string' ? req.body.unit.trim() : '';
+
+    if (
+      !['production', 'income', 'cost'].includes(type) ||
+      !category ||
+      !description ||
+      !occurredAt ||
+      !Number.isFinite(occurredAt.getTime()) ||
+      occurredAt.getTime() > Date.now()
+    ) {
+      return res.status(400).json({ error: 'Completa el tipo, la categoría, la descripción y una fecha real válida' });
+    }
+    if (type === 'production' && (!Number.isFinite(quantity) || quantity <= 0 || !unit)) {
+      return res.status(400).json({ error: 'Registra una cantidad y una unidad de producción o servicio válidas' });
+    }
+    if (
+      type !== 'production' &&
+      (!Number.isFinite(amount) || amount < 0 ||
+        (quantity != null && (!Number.isFinite(quantity) || quantity <= 0)) ||
+        (quantity != null && !unit))
+    ) {
+      return res.status(400).json({ error: 'Indica un monto igual o mayor que cero y, si registras cantidad, también su unidad' });
+    }
+
+    project.operationRecords.push({
+      type,
+      category,
+      description,
+      amount: type === 'production' ? 0 : amount,
+      quantity,
+      unit,
+      occurredAt,
+      createdById: req.user.id,
+    });
+    await project.save();
+    res.status(201).json(project.operationRecords.at(-1));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/:id/adjustments', async (req, res) => {
+  try {
+    const project = await Project.findOne({
+      _id: req.params.id,
+      $or: [{ leadId: req.user.id }, { memberIds: req.user.id }],
+    });
+    if (!project) return res.status(403).json({ error: 'No tienes acceso a este proyecto' });
+    const phaseIndex = PROJECT_PHASES.indexOf(project.formulation?.lifecycle?.phase);
+    if (
+      phaseIndex < PROJECT_PHASES.indexOf('evaluation') ||
+      !hasFinancialOperationEvidence(project.operationRecords)
+    ) {
+      return res.status(409).json({ error: 'Registra ingresos y costos reales y evalúa el proyecto antes de proponer ajustes' });
+    }
+
+    const description = typeof req.body.description === 'string'
+      ? req.body.description.trim()
+      : '';
+    const responsibleId = typeof req.body.responsibleId === 'string'
+      ? req.body.responsibleId
+      : null;
+    const targetDate = req.body.targetDate ? new Date(req.body.targetDate) : null;
+    if (!description) {
+      return res.status(400).json({ error: 'Describe el ajuste que se va a realizar' });
+    }
+    if (
+      responsibleId &&
+      ![project.leadId, ...project.memberIds].includes(responsibleId)
+    ) {
+      return res.status(400).json({ error: 'El responsable debe pertenecer al proyecto' });
+    }
+    if (targetDate && !Number.isFinite(targetDate.getTime())) {
+      return res.status(400).json({ error: 'La fecha objetivo no es válida' });
+    }
+
+    project.adjustments.push({
+      description,
+      responsibleId,
+      targetDate,
+      status: 'pending',
+      createdById: req.user.id,
+    });
+    await project.save();
+    res.status(201).json(project.adjustments.at(-1));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.patch('/:id/adjustments/:adjustmentId', async (req, res) => {
+  try {
+    const project = await Project.findOne({
+      _id: req.params.id,
+      $or: [{ leadId: req.user.id }, { memberIds: req.user.id }],
+    });
+    if (!project) return res.status(403).json({ error: 'No tienes acceso a este proyecto' });
+    const adjustment = project.adjustments.id(req.params.adjustmentId);
+    const statuses = ['pending', 'inProgress', 'completed', 'cancelled'];
+    if (!adjustment) return res.status(404).json({ error: 'No se encontró el ajuste' });
+    if (!statuses.includes(req.body.status)) {
+      return res.status(400).json({ error: 'El estado del ajuste no es válido' });
+    }
+    adjustment.status = req.body.status;
+    adjustment.completedAt = req.body.status === 'completed' ? new Date() : null;
+    await project.save();
+    res.json(adjustment);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -452,6 +725,36 @@ router.put('/:id/formulation', async (req, res) => {
       Array.isArray(req.body.formulation)
     ) {
       return res.status(400).json({ error: 'La formulación no es válida' });
+    }
+    if (
+      project.formulation?.lifecycle?.phase &&
+      typeof req.body.formulation.lifecycle?.phase !== 'string'
+    ) {
+      return res.status(400).json({
+        error: 'La formulación debe conservar la etapa actual del proyecto',
+      });
+    }
+    const executionEvidence = await hasExecutionEvidence(project);
+    const transitionError = getPhaseTransitionError({
+      project,
+      nextFormulation: req.body.formulation,
+      hasExecutionEvidence: executionEvidence,
+    });
+    if (transitionError) return res.status(409).json({ error: transitionError });
+
+    const nextPhase = req.body.formulation.lifecycle?.phase;
+    if (
+      PROJECT_PHASES.indexOf(nextPhase) >= PROJECT_PHASES.indexOf('investment')
+    ) {
+      const latestDecision = project.decisions?.at(-1);
+      if (
+        latestDecision?.outcome === 'accepted' &&
+        !isDecisionCurrent(latestDecision, req.body.formulation)
+      ) {
+        return res.status(409).json({
+          error: 'Los estudios cambiaron después de la aprobación. Regresa a decisión y vuelve a evaluar el proyecto.',
+        });
+      }
     }
     project.formulation = req.body.formulation;
     project.markModified('formulation');
@@ -487,11 +790,51 @@ router.put('/:id', async (req, res) => {
         error: 'El presupuesto no puede quedar por debajo de los gastos registrados y aprobados',
       });
     }
+    if (current.approvedBudget != null && budget !== current.approvedBudget) {
+      return res.status(409).json({
+        error: 'Para cambiar el presupuesto aprobado, registra una nueva decisión de aceptación',
+      });
+    }
+    const requestedStatus = req.body.status ?? current.status;
+    if (
+      requestedStatus === 'active' &&
+      requestedStatus !== current.status &&
+      current.formulation?.lifecycle?.phase
+    ) {
+      const investmentError = getInvestmentGateError(current);
+      if (
+        investmentError ||
+        PROJECT_PHASES.indexOf(current.formulation.lifecycle.phase) <
+          PROJECT_PHASES.indexOf('investment')
+      ) {
+        return res.status(409).json({
+          error: investmentError ??
+            'Lleva el proyecto a inversión antes de marcarlo como activo',
+        });
+      }
+    }
+    if (
+      requestedStatus === 'completed' &&
+      requestedStatus !== current.status &&
+      current.formulation?.lifecycle?.phase &&
+      (PROJECT_PHASES.indexOf(current.formulation.lifecycle.phase) <
+        PROJECT_PHASES.indexOf('evaluation') ||
+        !hasFinancialOperationEvidence(current.operationRecords))
+    ) {
+      return res.status(409).json({
+        error: 'Evalúa los resultados reales del proyecto antes de marcarlo como completado',
+      });
+    }
 
     const editableFields = { ...req.body };
     delete editableFields.spent;
     delete editableFields.reservedBudget;
     delete editableFields.expenses;
+    delete editableFields.approvedBudget;
+    delete editableFields.decisions;
+    delete editableFields.operationRecords;
+    delete editableFields.adjustments;
+    delete editableFields.formulation;
     const project = await Project.findOneAndUpdate({
       _id: req.params.id,
       leadId: req.user.id,
